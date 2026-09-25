@@ -132,6 +132,110 @@ show cdp neighbors
 
 **Verifica esta fase:** ninguna red se solapa con otra (IOS rechazará una IP con el mensaje `overlaps with`), cada VLAN tiene su gateway definido y cada enlace WAN tiene exactamente dos IPs.
 
+### Paso 1.6: Subneteo manual (VLSM)
+
+Cisco IOS no trae una calculadora de subredes: el subneteo se hace a mano (o con una hoja de cálculo) antes de configurar nada. Esta sección da el método paso a paso para cuando debas dividir un bloque grande en subredes de distinto tamaño (VLSM, Máscara de Subred de Longitud Variable), como al repartir un bloque entre VLANs con distinta cantidad de hosts o al sacar las /30 de la WAN.
+
+#### Fórmulas base
+
+| Cálculo | Fórmula |
+| --- | --- |
+| Bits de host necesarios | El menor `h` tal que 2^h − 2 ≥ hosts requeridos |
+| Hosts útiles de una subred | 2^(32 − prefijo) − 2 |
+| Prefijo a partir de los bits de host | 32 − h |
+| Tamaño del bloque (salto entre redes) | 2^(32 − prefijo) |
+| Total de subredes al tomar `n` bits prestados | 2^n |
+
+La resta de 2 en "hosts útiles" descuenta la dirección de red y la de broadcast; en enlaces /30 y /31 se usa igual, salvo que un /31 (sin broadcast, poco común en switches de acceso) da 2 usables exactos.
+
+#### Paso 1.6.1: Ordena los requisitos de mayor a menor
+
+En VLSM siempre se asigna primero el bloque que necesita más hosts, para no fragmentar el espacio disponible. Arma una tabla:
+
+| Segmento | Hosts requeridos | Hosts útiles a asignar (redondeo a la potencia de 2 más cercana) |
+| --- | --- | --- |
+| `<SEGMENTO_1>` | `<N>` | `<POTENCIA_DE_2> − 2` |
+| `<SEGMENTO_2>` | `<N>` | `<POTENCIA_DE_2> − 2` |
+
+#### Paso 1.6.2: Calcula el prefijo de cada segmento
+
+Para cada fila, busca la menor potencia de 2 que cubra los hosts requeridos y obtén el prefijo:
+
+| Hosts requeridos | Prefijo | Máscara | Hosts útiles |
+| --- | --- | --- | --- |
+| 1 a 2 | /30 | 255.255.255.252 | 2 |
+| 3 a 6 | /29 | 255.255.255.248 | 6 |
+| 7 a 14 | /28 | 255.255.255.240 | 14 |
+| 15 a 30 | /27 | 255.255.255.224 | 30 |
+| 31 a 62 | /26 | 255.255.255.192 | 62 |
+| 63 a 126 | /25 | 255.255.255.128 | 126 |
+| 127 a 254 | /24 | 255.255.255.0 | 254 |
+
+#### Paso 1.6.3: Asigna las direcciones en orden
+
+Parte del bloque disponible (`<BLOQUE_BASE>/<PREFIJO_BASE>`) y ve colocando cada segmento, del prefijo más largo (subred más chica) al más corto **o**, si prefieres el método clásico, del que necesita más hosts al que necesita menos; lo importante es no dejar huecos:
+
+1. Toma la primera dirección libre del bloque como red del segmento.
+2. Súmale el tamaño de bloque de ese prefijo (2^(32 − prefijo)) para obtener la siguiente red libre.
+3. Repite con el siguiente segmento.
+
+| Segmento | Prefijo | Red | Rango de hosts | Broadcast | Siguiente red libre |
+| --- | --- | --- | --- | --- | --- |
+| `<SEGMENTO_1>` | `/<PREFIJO>` | `<RED>.0` | `<RED>.1` – `<RED>.<MAX-1>` | `<RED>.<MAX>` | `<RED_SIGUIENTE>.0` |
+| `<SEGMENTO_2>` | `/<PREFIJO>` | `<RED_SIGUIENTE>.0` | … | … | … |
+
+#### Paso 1.6.4: Verifica a mano antes de configurar
+
+Dos comprobaciones rápidas evitan el error más común (solapar dos subredes):
+
+- La red de un segmento debe ser múltiplo exacto de su tamaño de bloque (por ejemplo, una /28 solo puede empezar en `.0`, `.16`, `.32`, `.48`...).
+- El broadcast de un segmento debe ser exactamente una dirección antes de la red del siguiente.
+
+Si el router rechaza una IP con `overlaps with`, casi siempre es un error de este paso: dos segmentos comparten direcciones porque el tamaño de bloque no se calculó bien.
+
+#### Ejemplo resuelto
+
+Repartir `192.168.10.0/24` entre tres VLANs con 60, 25 y 10 hosts, más un enlace WAN /30:
+
+| Segmento | Hosts | Prefijo | Red | Rango de hosts | Broadcast |
+| --- | --- | --- | --- | --- | --- |
+| VLAN A (60 hosts) | 60 | /26 | 192.168.10.0 | .1 – .62 | .63 |
+| VLAN B (25 hosts) | 25 | /27 | 192.168.10.64 | .65 – .94 | .95 |
+| VLAN C (10 hosts) | 10 | /28 | 192.168.10.96 | .97 – .110 | .111 |
+| Enlace WAN | 2 | /30 | 192.168.10.112 | .113 – .114 | .115 |
+
+Nota cómo cada red nueva empieza justo donde terminó el broadcast del bloque anterior, y que el prefijo de cada una es múltiplo de su propio tamaño.
+
+#### Comandos relacionados al aplicar el subneteo
+
+Cisco IOS no calcula subredes, pero sí valida lo que escribes y te ayuda a confirmarlo:
+
+```
+! Al poner una IP, IOS avisa si se solapa con otra ya configurada
+interface <INTERFAZ>
+ ip address <IP_CALCULADA> <MASCARA_CALCULADA>
+```
+
+```
+! Confirma máscara y estado de cada interfaz ya configurada
+show ip interface brief
+```
+
+```
+! Muestra máscara, broadcast y clase que IOS interpreta para una interfaz
+show interface <INTERFAZ>
+```
+
+```
+! Traduce una máscara a formato wildcard (útil para OSPF y EIGRP)
+! No es un comando nativo de cálculo, pero puedes comprobarlo así:
+! wildcard = 255.255.255.255 - máscara, octeto por octeto
+```
+
+Si tu versión de IOS lo soporta, `ping` y `traceroute` con la IP calculada son la prueba final de que la subred quedó bien definida y alcanzable, una vez configurada en el equipo correspondiente.
+
+**Verifica este paso:** ninguna red se solapa con otra, cada subred tiene el prefijo correcto para sus hosts requeridos y la suma de los bloques asignados no excede el espacio disponible del bloque base.
+
 ## Fase 2: Configuración base de todos los equipos
 
 Esta fase es idéntica en switches y routers y se repite en cada equipo antes de tocar VLANs o rutas. Un equipo con nombre propio y acceso protegido evita confundirlos después, cuando tengas ocho ventanas abiertas.
